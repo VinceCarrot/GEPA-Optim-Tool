@@ -22,6 +22,7 @@ from . import llm as llm_mod
 from . import objective as obj
 from . import protect
 from .dataset import INPUT_COL, TARGET_COL
+from .sanitize import sanitize_payload
 from .spec import METRIC_LABELS, RunConfig
 
 logger = logging.getLogger("gepa_tool.reflection")
@@ -318,6 +319,7 @@ async def analyze_errors(cfg: RunConfig, prompt_text: str, errors: Dict[str, Lis
             gold_label=pos if ex.get(TARGET_COL) == 1 else neg,
             error_type=error_type,
         )
+        payload = sanitize_payload(cfg, payload)
         async with sem:
             try:
                 res = await invoke(structured, payload)
@@ -358,6 +360,7 @@ async def cluster_errors(cfg: RunConfig, prompt_text: str, bundle: Dict, analyse
         error_analyses=_format_analyses(analyses),
         n_clusters=n_clusters,
     )
+    payload = sanitize_payload(cfg, payload)
     structured = await llm_mod.build_structured(cfg.models.reflection_model_id,
                                                 cfg.models.reflection_temperature, ClusteringOutput)
     return await _retrying(cfg.budget.reflection_timeout_seconds)(structured, payload)
