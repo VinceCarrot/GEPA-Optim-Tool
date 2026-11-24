@@ -23,7 +23,7 @@ class EventLog:
         self._lock = threading.Lock()
         self._seq = 0
         if os.path.exists(self.path):
-            with open(self.path) as f:
+            with open(self.path, encoding="utf-8") as f:
                 for line in f:
                     if line.strip():
                         try:
@@ -35,7 +35,7 @@ class EventLog:
         with self._lock:
             self._seq += 1
             ev = {"seq": self._seq, "ts": time.time(), "type": type_, **fields}
-            with open(self.path, "a") as f:
+            with open(self.path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(ev, default=_json_default) + "\n")
                 f.flush()
         return ev
@@ -60,7 +60,7 @@ def read_events(run_dir: str, after_seq: int = 0) -> List[dict]:
     out = []
     if not os.path.exists(path):
         return out
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         for line in f:
             if not line.strip():
                 continue
@@ -99,11 +99,11 @@ class CandidateStore:
 
     def save(self, c: Candidate) -> str:
         path = os.path.join(self.dir, f"{c.candidate_id}.md")
-        with open(path, "w") as f:
+        with open(path, "w", encoding="utf-8") as f:
             f.write(c.prompt_text)
         meta = asdict(c)
         meta.pop("prompt_text")
-        with open(self.index, "a") as f:
+        with open(self.index, "a", encoding="utf-8") as f:
             f.write(json.dumps(meta) + "\n")
         return path
 
@@ -111,7 +111,7 @@ class CandidateStore:
         path = os.path.join(self.dir, f"{candidate_id}.md")
         if not os.path.exists(path):
             return None
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             return f.read()
 
 
@@ -155,5 +155,5 @@ class ParetoArchive:
         return self.rng.choices(cands, weights=weights, k=1)[0]
 
     def save(self) -> None:
-        with open(self.state_path, "w") as f:
+        with open(self.state_path, "w", encoding="utf-8") as f:
             json.dump({"scores": self.scores, "mutation_counts": self.mutation_counts}, f)

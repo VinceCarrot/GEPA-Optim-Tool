@@ -1,12 +1,16 @@
-"""CLI: python -m gepa_tool.engine run CONFIG --run-dir DIR | trial CONFIG --out DIR [--n 50]"""
+"""CLI: python -m gepa_tool.engine run CONFIG --run-dir DIR | trial CONFIG --out DIR [--n 50]
+
+SafeChain by default; add --local-backend to use engine/local_backend.py (see llm.py)."""
 
 import argparse
 import sys
 
+from . import llm as llm_mod
 from .spec import load_config
 
 
 def main(argv=None) -> int:
+    argv = llm_mod.apply_backend_flag(sys.argv[1:] if argv is None else list(argv))
     ap = argparse.ArgumentParser(prog="gepa_tool.engine")
     sub = ap.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("run", help="run a full optimization")

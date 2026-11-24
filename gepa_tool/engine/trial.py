@@ -31,7 +31,8 @@ async def run_trial(cfg: RunConfig, out_dir: str, n: int = 50) -> dict:
     def prog(_pi, done, total, n_err):
         events.emit("eval_progress", candidate_id="seed", done=done, total=total, n_errors=n_err)
 
-    preds = await infer.run_one_async(cfg, cfg.seed_prompt, sample, prog)
+    # no retry passes: the trial reports the raw error rate so format/API problems are visible
+    preds = await infer.run_one_async(cfg, cfg.seed_prompt, sample, prog, retry_passes=0)
     elapsed = time.time() - t0
     bundle = ev.evaluate(cfg, preds, sample)
     summary = ev.summarize(bundle)
@@ -87,7 +88,7 @@ async def run_trial(cfg: RunConfig, out_dir: str, n: int = 50) -> dict:
                      "approx_hours": est_seconds / 3600.0},
         "warnings": warnings, "rows": rows,
     }
-    with open(os.path.join(out_dir, "trial_result.json"), "w") as f:
+    with open(os.path.join(out_dir, "trial_result.json"), "w", encoding="utf-8") as f:
         json.dump(result, f, indent=2, default=str)
     events.emit("trial_end", status="completed")
     return result
@@ -100,7 +101,7 @@ def run_trial_sync(cfg: RunConfig, out_dir: str, n: int = 50) -> int:
         return 0
     except Exception as e:
         os.makedirs(out_dir, exist_ok=True)
-        with open(os.path.join(out_dir, "trial_result.json"), "w") as f:
+        with open(os.path.join(out_dir, "trial_result.json"), "w", encoding="utf-8") as f:
             json.dump({"error": str(e)}, f)
         (events or EventLog(out_dir)).emit("trial_end", status="failed", error=str(e)[:2000])
         return 1

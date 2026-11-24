@@ -140,7 +140,6 @@ class AcceptanceSpec(BaseModel):
     strategy: Literal["feasibility_first", "legacy"] = "feasibility_first"
     epsilon: float = 0.01                      # feasible parent: child objective may drop by at most this
     infeasible_delta: float = 0.05             # infeasible parent: objective may drop by at most this while violation shrinks
-    degenerate_factor: float = 3.0             # reject if predicted-positive rate > factor x true positive rate (or == 0)
     feasibility_patience: Optional[int] = None  # rounds without any feasible candidate before an alert; None = 30% of rounds
 
 
@@ -164,6 +163,25 @@ class BudgetSpec(BaseModel):
     reflection_timeout_seconds: int = 180
     parallel_children: bool = True            # evaluate a round's children concurrently (shared worker pool)
     final_test_eval: bool = True
+    # Inference-error handling: when more than max_error_rate of a prompt's rows failed (after the
+    # per-call retries), re-run only the failed rows, up to error_retry_passes times. A child that is
+    # still above max_error_rate is marked "error" (excluded like a rejected child).
+    max_error_rate: float = 0.01
+    error_retry_passes: int = 3
+
+    @field_validator("max_error_rate")
+    @classmethod
+    def _rate(cls, v):
+        if not 0.0 <= v <= 1.0:
+            raise ValueError("must be between 0 and 1")
+        return v
+
+    @field_validator("error_retry_passes")
+    @classmethod
+    def _nonneg(cls, v):
+        if v < 0:
+            raise ValueError("must be >= 0")
+        return v
 
     @field_validator("max_rounds", "scoring_set_size", "proposals_per_round", "max_workers")
     @classmethod
@@ -209,10 +227,10 @@ class RunConfig(BaseModel):
 
 
 def load_config(path: str) -> RunConfig:
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         return RunConfig.model_validate(yaml.safe_load(f))
 
 
 def dump_config(cfg: RunConfig, path: str) -> None:
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         yaml.safe_dump(cfg.model_dump(mode="json"), f, sort_keys=False, allow_unicode=True, width=120)

@@ -33,6 +33,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ValidationError
 
 from ..engine import dataset as ds
+from ..engine import llm as llm_mod
 from ..engine import objective as ob
 from ..engine import protect
 from ..engine.spec import DataSpec, ModelSpec, ObjectiveSpec, RunConfig, dump_config, load_config
@@ -45,7 +46,8 @@ UPLOADS = os.path.join(WORKSPACE, "uploads")
 RUNS = os.path.join(WORKSPACE, "runs")
 TRIALS = os.path.join(WORKSPACE, "trials")
 LOCK = os.path.join(WORKSPACE, "active_run.json")
-SETTINGS = os.path.join(WORKSPACE, "settings.yaml")
+# Saved settings are kept per backend so a local-backend model id never leaks into SafeChain mode.
+SETTINGS = os.path.join(WORKSPACE, "settings.yaml" if llm_mod.backend() is None else "settings_local.yaml")
 WEB_DIST = os.path.join(PKG_DIR, "web", "dist")
 STOP_GRACE_SECONDS = 10
 
@@ -74,10 +76,20 @@ def _default_settings() -> dict:
     }
 
 
+def _backend_defaults() -> dict:
+    be = llm_mod.backend()
+    if be is None or not hasattr(be, "ui_defaults"):
+        return {}
+    return be.ui_defaults() or {}
+
+
 def get_settings() -> dict:
     s = _default_settings()
+    nl_default = (_backend_defaults().get("models") or {}).get("nl2spec_model_id")
+    if nl_default:
+        s["nl2spec_model_id"] = nl_default
     if os.path.exists(SETTINGS):
-        with open(SETTINGS) as f:
+        with open(SETTINGS, encoding="utf-8") as f:
             s.update(yaml.safe_load(f) or {})
     return s
 
@@ -85,9 +97,15 @@ def get_settings() -> dict:
 @app.get("/api/settings")
 def api_settings():
     s = get_settings()
+    be = llm_mod.backend()
+    s["backend_mode"] = "safechain" if be is None else "local"
+    if be is not None:
+        # A local LLM backend replaces SafeChain on this machine; its models replace config_gpt.yml.
+        return {**s, "models": be.list_models(), "backend": getattr(be, "NAME", be.__name__),
+                "ui_defaults": _backend_defaults()}
     models = []
     try:
-        with open(s["model_config_path"]) as f:
+        with open(s["model_config_path"], encoding="utf-8") as f:
             mc = yaml.safe_load(f) or {}
         for mid, m in (mc.get("models") or {}).items():
             if (m or {}).get("type", "chat") == "chat":
@@ -107,7 +125,7 @@ class SettingsIn(BaseModel):
 def api_put_settings(body: SettingsIn):
     s = get_settings()
     s.update({k: v for k, v in body.model_dump().items() if v is not None})
-    with open(SETTINGS, "w") as f:
+    with open(SETTINGS, "w", encoding="utf-8") as f:
         yaml.safe_dump({k: s[k] for k in ("model_config_path", "env_file", "nl2spec_model_id")}, f)
     return api_settings()
 
@@ -279,16 +297,61 @@ def describe_objective(body: Dict[str, Any]):
 # Process helpers
 # ---------------------------------------------------------------------------
 
+IS_WINDOWS = os.name == "nt"
+
+
 def _spawn(args: List[str], log_path: str) -> subprocess.Popen:
     env = dict(os.environ)
     env["PYTHONPATH"] = REPO_ROOT + os.pathsep + env.get("PYTHONPATH", "")
     env["PYTHONUNBUFFERED"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
     logf = open(log_path, "ab")
+    # Own process group, so Stop can signal the engine and everything it started.
+    group = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if IS_WINDOWS
+             else {"start_new_session": True})
     return subprocess.Popen([get_settings()["python"], "-m", "gepa_tool.engine", *args], cwd=REPO_ROOT,
-                            stdout=logf, stderr=subprocess.STDOUT, start_new_session=True, env=env)
+                            stdout=logf, stderr=subprocess.STDOUT, env=env, **group)
+
+
+# Windows: a "group" is the engine process plus its descendants (tracked with psutil).
+# "term" sends CTRL_BREAK_EVENT to the engine's process group (the engine turns it into a
+# graceful stop); "kill" terminates the whole process tree.
+
+def _win_alive(pid: int) -> bool:
+    import psutil
+    try:
+        return psutil.Process(pid).status() != psutil.STATUS_ZOMBIE
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return psutil.pid_exists(pid)
+
+
+def _win_signal(pid: int, sig: str) -> bool:
+    import psutil
+    if not _win_alive(pid):
+        return False
+    if sig == "term":
+        try:
+            os.kill(pid, signal.CTRL_BREAK_EVENT)
+            return True
+        except OSError:
+            pass  # no shared console: fall through to a hard kill
+    try:
+        root = psutil.Process(pid)
+        procs = root.children(recursive=True) + [root]
+    except psutil.NoSuchProcess:
+        return False
+    for p in procs:
+        try:
+            p.kill()
+        except psutil.NoSuchProcess:
+            pass
+    psutil.wait_procs(procs, timeout=5)
+    return True
 
 
 def _group_alive(pgid: int) -> bool:
+    if IS_WINDOWS:
+        return _win_alive(pgid)
     try:
         os.killpg(pgid, 0)
         return True
@@ -305,6 +368,11 @@ def _group_alive(pgid: int) -> bool:
 
 def _reap(pid: int) -> None:
     """Collect an exited child so it does not linger as a zombie (zombie groups look 'alive')."""
+    if IS_WINDOWS:
+        for p in list(_run_procs.values()) + list(_trial_procs.values()):
+            if p.pid == pid:
+                p.poll()
+        return
     try:
         os.waitpid(pid, os.WNOHANG)
     except ChildProcessError:
@@ -313,10 +381,12 @@ def _reap(pid: int) -> None:
         pass
 
 
-def _signal_group(pgid: int, sig: int) -> bool:
-    """Send sig to the group. False if the group no longer exists (or only zombies remain)."""
+def _signal_group(pgid: int, sig: str) -> bool:
+    """Send sig ('term' | 'kill') to the group. False if the group no longer exists (or only zombies remain)."""
+    if IS_WINDOWS:
+        return _win_signal(pgid, sig)
     try:
-        os.killpg(pgid, sig)
+        os.killpg(pgid, signal.SIGTERM if sig == "term" else signal.SIGKILL)
         return True
     except ProcessLookupError:
         return False
@@ -329,7 +399,7 @@ def _signal_group(pgid: int, sig: int) -> bool:
 def _kill_group(pgid: int, grace: float = STOP_GRACE_SECONDS) -> str:
     """SIGTERM the process group, wait, then SIGKILL. Returns 'terminated' | 'killed' | 'not_running'."""
     _reap(pgid)
-    if not _group_alive(pgid) or not _signal_group(pgid, signal.SIGTERM):
+    if not _group_alive(pgid) or not _signal_group(pgid, "term"):
         return "not_running"
     deadline = time.time() + grace
     while time.time() < deadline:
@@ -337,7 +407,7 @@ def _kill_group(pgid: int, grace: float = STOP_GRACE_SECONDS) -> str:
         if not _group_alive(pgid):
             return "terminated"
         time.sleep(0.25)
-    if not _signal_group(pgid, signal.SIGKILL):
+    if not _signal_group(pgid, "kill"):
         return "terminated"
     for _ in range(20):
         _reap(pgid)
@@ -351,7 +421,7 @@ def _read_lock() -> Optional[dict]:
     if not os.path.exists(LOCK):
         return None
     try:
-        with open(LOCK) as f:
+        with open(LOCK, encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return None
@@ -425,14 +495,14 @@ def get_trial(tid: str):
         log = ""
         lp = os.path.join(out, "process.log")
         if os.path.exists(lp):
-            with open(lp) as f:
+            with open(lp, encoding="utf-8") as f:
                 log = f.read()[-3000:]
         return {"status": "failed", "error": "trial process exited", "log": log}
     if end is None:
         return {"status": "running", "progress": prog[-1] if prog else None}
     result = None
     if os.path.exists(res_path):
-        with open(res_path) as f:
+        with open(res_path, encoding="utf-8") as f:
             result = json.load(f)
     return {"status": end.get("status", "completed"), "result": result, "error": (result or {}).get("error")}
 
@@ -474,7 +544,7 @@ def start_run(body: RunIn):
         p = _spawn(["run", cfg_path, "--run-dir", run_dir], os.path.join(run_dir, "process.log"))
         _run_procs[run_id] = p
         lock = {"run_id": run_id, "pid": p.pid, "pgid": p.pid, "started_at": time.time(), "name": cfg.name}
-        with open(LOCK, "w") as f:
+        with open(LOCK, "w", encoding="utf-8") as f:
             json.dump(lock, f)
     return lock
 
@@ -521,12 +591,12 @@ def get_run(run_id: str):
     for name in ("run_config.yaml", "submitted_config.yaml"):
         p = os.path.join(d, name)
         if os.path.exists(p):
-            with open(p) as f:
+            with open(p, encoding="utf-8") as f:
                 out["config"] = yaml.safe_load(f)
             break
     fr = os.path.join(d, "final_result.json")
     if os.path.exists(fr):
-        with open(fr) as f:
+        with open(fr, encoding="utf-8") as f:
             out["final_result"] = json.load(f)
     return out
 
@@ -577,12 +647,12 @@ def get_candidate(run_id: str, cid: str):
     path = os.path.join(d, "candidates", os.path.basename(cid) + ".md")
     if not os.path.exists(path):
         raise HTTPException(404, "candidate not found")
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         prompt = f.read()
     meta = {}
     idx = os.path.join(d, "candidates.jsonl")
     if os.path.exists(idx):
-        with open(idx) as f:
+        with open(idx, encoding="utf-8") as f:
             for line in f:
                 m = json.loads(line)
                 if m.get("candidate_id") == cid:

@@ -31,9 +31,13 @@ def evaluate(cfg: RunConfig, preds: pd.DataFrame, gold: pd.DataFrame,
     threshold:         calibrated operating point on risk_score (always computed, informational in label mode)
     metrics:           the operating point used for accept/reject (label or threshold per scoring_mode)
     feasible/violation/optimization_score: from the ObjectiveSpec
+    error_rate / inference_failed: share of rows that still errored after the retry passes, and
+                       whether it exceeds budget.max_error_rate (the candidate is then not scored)
     """
     spec = cfg.objective
     n_errors = int((preds["classification"] == ERROR_LABEL).sum()) if len(preds) else 0
+    err_rate = n_errors / len(gold) if len(gold) else 0.0
+    failed = err_rate > cfg.budget.max_error_rate
     merged = merge_predictions(cfg, preds, gold)
     if save_path:
         merged.to_parquet(save_path, index=False)
@@ -45,6 +49,7 @@ def evaluate(cfg: RunConfig, preds: pd.DataFrame, gold: pd.DataFrame,
             "threshold": {"threshold": 0.5, "metrics": empty, "feasible": False},
             "feasible": False, "violation": obj.violation(spec, empty),
             "optimization_score": 0.0, "n_errors": n_errors, "merged": merged,
+            "error_rate": err_rate, "inference_failed": True,
         }
 
     y_true = merged[TARGET_COL].to_numpy()
@@ -59,6 +64,8 @@ def evaluate(cfg: RunConfig, preds: pd.DataFrame, gold: pd.DataFrame,
         "violation": obj.violation(spec, op),
         "optimization_score": obj.optimization_score(spec, op),
         "n_errors": n_errors,
+        "error_rate": err_rate,
+        "inference_failed": failed,
         "merged": merged,
     }
 
@@ -75,6 +82,8 @@ def summarize(bundle: Dict) -> Dict:
         "feasible": bundle["feasible"],
         "violation": bundle["violation"],
         "n_errors": bundle["n_errors"],
+        "error_rate": bundle.get("error_rate", 0.0),
+        "inference_failed": bundle.get("inference_failed", False),
         "threshold": bundle["threshold"]["threshold"],
         "label_precision": bundle["label_metrics"]["precision"],
         "label_recall": bundle["label_metrics"]["recall"],

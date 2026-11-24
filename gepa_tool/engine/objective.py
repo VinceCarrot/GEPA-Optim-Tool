@@ -169,31 +169,14 @@ REASONS = {
     "same_violation_objective_up": "Same constraint gap and objective not lower",
     "same_violation_objective_down": "Same constraint gap and lower objective",
     "violation_increased": "Further away from meeting the constraints",
-    "degenerate_all_positive": "Degenerate: predicts positive far more often than the true positive rate",
-    "degenerate_no_positive": "Degenerate: predicts no positives at all",
-    "no_valid_predictions": "Every prediction errored; nothing to score",
+    "inference_errors": "Too many rows failed with API errors (after retries); not scored",
 }
-
-
-def _degenerate(acc: AcceptanceSpec, m: Dict[str, float]) -> Optional[str]:
-    if m["n"] == 0:
-        return "no_valid_predictions"
-    if m["n_predicted_positive"] == 0 and m["n_positive"] > 0:
-        return "degenerate_no_positive"
-    if m["positive_rate"] > 0 and m["predicted_positive_rate"] > acc.degenerate_factor * m["positive_rate"] \
-            and m["predicted_positive_rate"] > 0.5:
-        return "degenerate_all_positive"
-    return None
 
 
 def decide(spec: ObjectiveSpec, acc: AcceptanceSpec, parent_m: Dict, child_m: Dict) -> Tuple[bool, str]:
     """Return (accepted, reason_code) for a child versus its parent (operating-point metrics)."""
     if acc.strategy == "legacy":
         return _decide_legacy(spec, acc, parent_m, child_m)
-
-    deg = _degenerate(acc, child_m)
-    if deg:
-        return False, deg
 
     obj_p, obj_c = parent_m[spec.maximize], child_m[spec.maximize]
     p_feas, c_feas = is_feasible(spec, parent_m), is_feasible(spec, child_m)
@@ -218,7 +201,7 @@ def decide(spec: ObjectiveSpec, acc: AcceptanceSpec, parent_m: Dict, child_m: Di
 
 
 def _decide_legacy(spec: ObjectiveSpec, acc: AcceptanceSpec, parent_m: Dict, child_m: Dict) -> Tuple[bool, str]:
-    """Exact port of GEPA/optimizer.py feasibility-first rule (no delta, no degenerate check).
+    """Exact port of GEPA/optimizer.py feasibility-first rule (no delta).
 
     With a single `recall >= target` constraint, violation = target - recall, so
     "violation shrank" is exactly the legacy "child_r > parent_r" branch.

@@ -1,0 +1,13 @@
+# Machine-specific LLM backend (see engine/llm.py); never commit
+gepa_tool/engine/local_backend.py
+
+# Local data / run outputs
+gepa_tool/workspace/
+
+# Python
+__pycache__/
+*.pyc
+
+# Frontend (web/dist is committed: the server serves it, so deployments need no Node build;
+# run `npm run build` before committing UI changes)
+gepa_tool/web/node_modules/

@@ -14,6 +14,19 @@ npm run dev        # http://localhost:5173
 npm run build      # -> web/dist, served by the FastAPI app
 ```
 
+Windows (conda): `conda activate optim` then `python -m gepa_tool.server`. Stop sends CTRL_BREAK to the
+engine's process group (graceful: best prompt so far is written), then kills the process tree.
+
+## LLM backend
+SafeChain by default, for the server and the engine CLI. A machine can add another backend without code
+changes: put a module at `gepa_tool/engine/local_backend.py` (gitignored) and start with
+`python -m gepa_tool.server --local-backend` (the module may define extra alias flags in `CLI_FLAGS`).
+`GEPA_LLM_BACKEND=<module>` does the same through the environment. Engine processes started by the server
+inherit the choice. The module provides `build_structured(model_id, temperature, schema)`, `list_models()`
+and optionally `ui_defaults()`; see the docstring in `engine/llm.py`. Saved settings are kept per mode
+(`workspace/settings.yaml` / `settings_local.yaml`), and the setup wizard resets model ids and budget
+when the mode changes.
+
 ## Headless (no UI)
 ```bash
 python -m gepa_tool.engine validate gepa_tool/configs/amex_error_20261117.yaml
@@ -53,5 +66,8 @@ Markers are stripped before the prompt is sent to the task model.
 ## Acceptance (feasibility_first)
 * parent misses a constraint: accept if the total constraint gap shrinks and the objective drops ≤ δ (0.05), or the gap is unchanged and the objective does not drop; entering the feasible region is always accepted.
 * parent meets all constraints: child must also meet them and lose ≤ ε (0.01) of the objective.
-* degenerate children (predict-positive rate > 3× the true rate and > 50%, or no positives) are rejected.
+* inference errors: when more than `budget.max_error_rate` (1%) of a candidate's rows failed after the per-call
+  retries, only the failed rows are re-run, up to `budget.error_retry_passes` (3) passes. A child still above the
+  limit gets status `error` (shown in amber): it is excluded like a rejected child (not in the pool, the Pareto
+  archive or the mutation history) and the run continues. A seed above the limit only raises an alert.
 * `legacy` reproduces GEPA/optimizer.py exactly (used for regression checks).

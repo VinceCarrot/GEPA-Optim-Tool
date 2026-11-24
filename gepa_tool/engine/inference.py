@@ -35,13 +35,17 @@ def _escape_braces(prompt_text: str, placeholder_name: str) -> str:
 
 
 async def build_chain(cfg: RunConfig, prompt_text: str):
-    from safechain.prompts import ValidPromptTemplate
-
     var = cfg.task.input_placeholder
     text = protect.strip_markers(prompt_text)
     escaped = _escape_braces(text, var)
     if "{" + var + "}" not in escaped:
         raise ValueError(f"Prompt is missing the required {{{var}}} placeholder")
+    schema = llm_mod.classification_schema(cfg.task)
+    if llm_mod.backend() is not None:
+        structured = await llm_mod.build_structured(cfg.models.task_model_id, cfg.models.task_temperature, schema)
+        return llm_mod.TemplateChain(escaped, var, structured)
+
+    from safechain.prompts import ValidPromptTemplate
     template = ValidPromptTemplate(template=escaped, input_variables=[var])
     llm = await llm_mod.build_llm(cfg.models.task_model_id, cfg.models.task_temperature)
     return template | llm.with_structured_output(llm_mod.classification_schema(cfg.task))
@@ -93,19 +97,35 @@ class _ChainHolder:
             return self.chain
 
 
+RetryFn = Callable[[int, int, int], None]  # (prompt_index, pass_no, n_rows_to_retry)
+
+
+def error_rate(n_errors: int, total: int) -> float:
+    return n_errors / total if total else 0.0
+
+
 async def run_many_async(
     cfg: RunConfig,
     prompt_texts: List[str],
     df: pd.DataFrame,
     progress: Optional[ProgressFn] = None,
     progress_every: int = 50,
+    retry_passes: Optional[int] = None,
+    on_retry: Optional[RetryFn] = None,
 ) -> List[pd.DataFrame]:
     """Evaluate each prompt on every row of df; returns one predictions frame per prompt.
 
     Rows are interleaved across prompts (row 0 of every prompt, then row 1, ...) so all
     candidates progress together under the shared concurrency limit.
+
+    Error retry passes: after the first pass, any prompt whose share of ERROR rows exceeds
+    budget.max_error_rate has only its failed rows re-run; this repeats up to `retry_passes`
+    times (default budget.error_retry_passes), so each row is re-run at most that many times.
+    Every pass re-checks the rate and stops early once it is at or below the limit.
     """
     b = cfg.budget
+    if retry_passes is None:
+        retry_passes = b.error_retry_passes
     id_col = cfg.data.id_col
     var = cfg.task.input_placeholder
     semaphore = asyncio.Semaphore(b.max_workers)
@@ -134,51 +154,74 @@ async def run_many_async(
     ids = df[id_col].tolist()
     texts = df[INPUT_COL].tolist()
     total = len(df)
-    done = [0] * len(prompt_texts)
-    errors = [0] * len(prompt_texts)
-    last_emit = [0.0] * len(prompt_texts)
+    n_prompts = len(prompt_texts)
+    done = [0] * n_prompts
+    errors = [0] * n_prompts
+    last_emit = [0.0] * n_prompts
+    results: List[List[Optional[Dict[str, Any]]]] = [[None] * total for _ in range(n_prompts)]
 
-    def _tick(pi: int, failed: bool):
-        done[pi] += 1
-        if failed:
-            errors[pi] += 1
+    def _emit(pi: int, force: bool = False):
         if progress is None:
             return
         now = time.time()
-        if done[pi] == total or done[pi] % progress_every == 0 or now - last_emit[pi] > 5:
+        if force or done[pi] == total or done[pi] % progress_every == 0 or now - last_emit[pi] > 5:
             last_emit[pi] = now
             progress(pi, done[pi], total, errors[pi])
 
-    async def _row(pi: int, i: int):
+    async def _row(pi: int, i: int, is_retry: bool):
         await asyncio.sleep(b.request_delay)
         try:
             async with semaphore:
                 res = await _call(holders[pi], texts[i], i)
             res["row_id"] = ids[i]
-            _tick(pi, False)
-            return res
+            results[pi][i] = res
+            if is_retry:
+                errors[pi] -= 1
+            else:
+                done[pi] += 1
         except asyncio.CancelledError:
             raise
-        except Exception as e:  # permanent failure after retries
+        except Exception as e:  # permanent failure after the per-call retries
             logger.error("prompt %d row %s failed permanently: %s", pi, ids[i], e)
-            _tick(pi, True)
-            return _error_row(ids[i], str(e))
+            results[pi][i] = _error_row(ids[i], str(e))
+            if not is_retry:
+                done[pi] += 1
+                errors[pi] += 1
+        _emit(pi, force=is_retry and errors[pi] == 0)
 
-    n_prompts = len(prompt_texts)
-    order = [(pi, i) for i in range(total) for pi in range(n_prompts)]  # interleaved
-    tasks = [asyncio.ensure_future(_row(pi, i)) for pi, i in order]
-    try:
-        results = await asyncio.gather(*tasks)
-    except BaseException:
-        for t in tasks:
-            t.cancel()
-        raise
-    per_prompt: List[List[Dict[str, Any]]] = [[] for _ in range(n_prompts)]
-    for (pi, _i), res in zip(order, results):
-        per_prompt[pi].append(res)
-    return [pd.DataFrame(rows).rename(columns={"row_id": id_col}) for rows in per_prompt]
+    async def _gather(jobs, is_retry: bool):
+        tasks = [asyncio.ensure_future(_row(pi, i, is_retry)) for pi, i in jobs]
+        try:
+            await asyncio.gather(*tasks)
+        except BaseException:
+            for t in tasks:
+                t.cancel()
+            raise
+
+    await _gather([(pi, i) for i in range(total) for pi in range(n_prompts)], False)  # interleaved
+
+    for pass_no in range(1, retry_passes + 1):
+        jobs = []
+        for pi in range(n_prompts):
+            if error_rate(errors[pi], total) <= b.max_error_rate:
+                continue
+            failed = [i for i, r in enumerate(results[pi]) if r is None or r.get("classification") == ERROR_LABEL]
+            logger.warning("prompt %d: %d/%d rows errored (> %.1f%%); retry pass %d/%d",
+                           pi, len(failed), total, 100 * b.max_error_rate, pass_no, retry_passes)
+            if on_retry is not None:
+                on_retry(pi, pass_no, len(failed))
+            jobs.extend((pi, i) for i in failed)
+        if not jobs:
+            break
+        await _gather(jobs, True)
+        for pi in {pi for pi, _ in jobs}:
+            _emit(pi, force=True)
+
+    return [pd.DataFrame(rows).rename(columns={"row_id": id_col}) for rows in results]
 
 
 async def run_one_async(cfg: RunConfig, prompt_text: str, df: pd.DataFrame,
-                        progress: Optional[ProgressFn] = None) -> pd.DataFrame:
-    return (await run_many_async(cfg, [prompt_text], df, progress))[0]
+                        progress: Optional[ProgressFn] = None, retry_passes: Optional[int] = None,
+                        on_retry: Optional[RetryFn] = None) -> pd.DataFrame:
+    return (await run_many_async(cfg, [prompt_text], df, progress,
+                                 retry_passes=retry_passes, on_retry=on_retry))[0]

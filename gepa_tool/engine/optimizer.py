@@ -86,6 +86,12 @@ class Optimizer:
                              done=done, total=total, n_errors=n_err)
         return cb
 
+    def _retry_cb(self, ids: List[str], round_no: int):
+        def cb(pi: int, pass_no: int, n_rows: int):
+            self.events.emit("eval_retry", round=round_no, candidate_id=ids[pi], attempt=pass_no,
+                             max_attempts=self.cfg.budget.error_retry_passes, n_rows=n_rows)
+        return cb
+
     def _best_summary(self) -> dict:
         bid = self.best_id()
         return {"best_id": bid, "best": ev.summarize(self.bundles[bid])}
@@ -117,7 +123,8 @@ class Optimizer:
         self.events.emit("candidate_proposed", round=0, candidate_id="seed", parent_id=None,
                          target_cluster="", rationale="seed prompt", generation=0)
         self.events.emit("stage", round=0, stage="evaluate", status="start")
-        preds = await infer.run_one_async(cfg, seed.prompt_text, scoring, self._progress_cb(["seed"], 0))
+        preds = await infer.run_one_async(cfg, seed.prompt_text, scoring, self._progress_cb(["seed"], 0),
+                                          on_retry=self._retry_cb(["seed"], 0))
         bundle = ev.evaluate(cfg, preds, scoring, save_path=self._pred_path("seed", "scoring_round0"))
         self.events.emit("stage", round=0, stage="evaluate", status="done")
         self.bundles["seed"] = bundle
@@ -125,7 +132,14 @@ class Optimizer:
         self.archive.add("seed", ev.per_instance_correct(cfg, bundle["merged"]))
         self.archive.save()
         self.events.emit("candidate_decision", round=0, candidate_id="seed", parent_id=None,
-                         accepted=True, reason_code="seed", metrics=ev.summarize(bundle))
+                         accepted=True, status="accepted", reason_code="seed", metrics=ev.summarize(bundle))
+        if bundle["inference_failed"]:
+            # The seed is the root of the search, so it stays in the pool; its metrics are on fewer rows.
+            self.events.emit("inference_alert", round=0, candidate_id="seed", n_errors=bundle["n_errors"],
+                             message=(f"Seed: {bundle['n_errors']} of {len(scoring)} scoring rows "
+                                      f"({100 * bundle['error_rate']:.1f}%) still failed with API errors after "
+                                      f"{cfg.budget.error_retry_passes} retry passes. The run continues; seed "
+                                      f"metrics are computed on the rows that succeeded."))
 
         feasible_alerted = False
         current_phase = self.phase()
@@ -194,14 +208,17 @@ class Optimizer:
             ids = [c.candidate_id for c in children]
             self.events.emit("stage", round=r, stage="evaluate", status="start")
             prog = self._progress_cb(ids, r)
+            on_retry = self._retry_cb(ids, r)
             if cfg.budget.parallel_children:
-                preds_list = await infer.run_many_async(cfg, [c.prompt_text for c in children], scoring, prog)
+                preds_list = await infer.run_many_async(cfg, [c.prompt_text for c in children], scoring, prog,
+                                                        on_retry=on_retry)
             else:
                 preds_list = []
                 for k, c in enumerate(children):
                     one = await infer.run_one_async(
                         cfg, c.prompt_text, scoring,
-                        lambda _pi, d, t, e, _k=k: prog(_k, d, t, e))
+                        lambda _pi, d, t, e, _k=k: prog(_k, d, t, e),
+                        on_retry=lambda _pi, a, n, _k=k: on_retry(_k, a, n))
                     preds_list.append(one)
             self.events.emit("stage", round=r, stage="evaluate", status="done")
 
@@ -210,9 +227,18 @@ class Optimizer:
             for c, preds in zip(children, preds_list):
                 cb = ev.evaluate(cfg, preds, scoring, save_path=self._pred_path(c.candidate_id, f"scoring_round{r}"))
                 self.bundles[c.candidate_id] = cb
+                if cb["inference_failed"]:
+                    # Error state: neither accepted nor rejected on merit. Treated like a rejection (not in
+                    # the pool / Pareto archive / mutation history); the round and the run carry on.
+                    reason_text = (f"{cb['n_errors']} of {len(scoring)} rows ({100 * cb['error_rate']:.1f}%) "
+                                   f"still failed with API errors after {cfg.budget.error_retry_passes} retry "
+                                   f"passes (limit {100 * cfg.budget.max_error_rate:g}%)")
+                    self.events.emit("candidate_decision", round=r, candidate_id=c.candidate_id,
+                                     parent_id=parent_id, accepted=False, status="error",
+                                     reason_code="inference_errors", reason=reason_text,
+                                     metrics=ev.summarize(cb), parent_metrics=ev.summarize(pb))
+                    continue
                 accepted, reason = obj.decide(cfg.objective, cfg.acceptance, pb["metrics"], cb["metrics"])
-                if cb["metrics"]["n"] == 0:
-                    accepted, reason = False, "no_valid_predictions"
                 pm, cm = pb["metrics"], cb["metrics"]
                 self.history.append({
                     "round": r, "rationale": c.rationale,
@@ -225,7 +251,7 @@ class Optimizer:
                     self.pool[c.candidate_id] = c
                     self.archive.add(c.candidate_id, ev.per_instance_correct(cfg, cb["merged"]))
                 self.events.emit("candidate_decision", round=r, candidate_id=c.candidate_id, parent_id=parent_id,
-                                 accepted=accepted, reason_code=reason, reason=obj.REASONS.get(reason, reason),
+                                 accepted=accepted, status="accepted" if accepted else "rejected", reason_code=reason, reason=obj.REASONS.get(reason, reason),
                                  metrics=ev.summarize(cb), parent_metrics=ev.summarize(pb))
             self.archive.save()
             self.events.emit("stage", round=r, stage="decision", status="done")
@@ -245,16 +271,18 @@ class Optimizer:
         cfg = self.cfg
         bid = self.best_id()
         best = self.pool[bid]
-        with open(os.path.join(self.run_dir, "best_prompt.md"), "w") as f:
+        with open(os.path.join(self.run_dir, "best_prompt.md"), "w", encoding="utf-8") as f:
             f.write(best.prompt_text)
         result = {"best_candidate_id": bid, "scoring": ev.summarize(self.bundles[bid]),
                   "seed_scoring": ev.summarize(self.bundles["seed"]), "status": status}
         if status == "completed" and cfg.budget.final_test_eval and len(test_df):
             self.events.emit("stage", round=cfg.budget.max_rounds + 1, stage="final_test", status="start")
             cands = [bid] if bid == "seed" else [bid, "seed"]
+            test_ids = [f"{c}@test" for c in cands]
             preds_list = await infer.run_many_async(
                 cfg, [self.pool[c].prompt_text for c in cands], test_df,
-                self._progress_cb([f"{c}@test" for c in cands], cfg.budget.max_rounds + 1))
+                self._progress_cb(test_ids, cfg.budget.max_rounds + 1),
+                on_retry=self._retry_cb(test_ids, cfg.budget.max_rounds + 1))
             for c, p in zip(cands, preds_list):
                 tb = ev.evaluate(cfg, p, test_df, save_path=self._pred_path(c, "final_test"))
                 result["test" if c == bid else "seed_test"] = ev.summarize(tb)
@@ -262,7 +290,7 @@ class Optimizer:
                 result["seed_test"] = result["test"]
             self.events.emit("stage", round=cfg.budget.max_rounds + 1, stage="final_test", status="done")
         import json
-        with open(os.path.join(self.run_dir, "final_result.json"), "w") as f:
+        with open(os.path.join(self.run_dir, "final_result.json"), "w", encoding="utf-8") as f:
             json.dump(result, f, indent=2, default=str)
         self.events.emit("run_end", duration=time.time() - t0, **result)
 
@@ -271,12 +299,12 @@ class Optimizer:
         try:
             if self.pool:
                 bid = self.best_id()
-                with open(os.path.join(self.run_dir, "best_prompt.md"), "w") as f:
+                with open(os.path.join(self.run_dir, "best_prompt.md"), "w", encoding="utf-8") as f:
                     f.write(self.pool[bid].prompt_text)
                 import json
                 result = {"best_candidate_id": bid, "scoring": ev.summarize(self.bundles[bid]),
                           "seed_scoring": ev.summarize(self.bundles["seed"]), "status": "stopped"}
-                with open(os.path.join(self.run_dir, "final_result.json"), "w") as f:
+                with open(os.path.join(self.run_dir, "final_result.json"), "w", encoding="utf-8") as f:
                     json.dump(result, f, indent=2, default=str)
                 self.events.emit("run_end", duration=time.time() - t0, **result)
             else:
@@ -316,11 +344,14 @@ def run(cfg: RunConfig, run_dir: str) -> int:
         opt.stopped = True
         main.cancel()
 
-    for sig in (signal.SIGTERM, signal.SIGINT):
+    sigs = [signal.SIGTERM, signal.SIGINT]
+    if hasattr(signal, "SIGBREAK"):  # Windows: the server stops a run with CTRL_BREAK_EVENT
+        sigs.append(signal.SIGBREAK)
+    for sig in sigs:
         try:
             loop.add_signal_handler(sig, _on_signal, sig)
-        except NotImplementedError:  # pragma: no cover (non-POSIX)
-            pass
+        except NotImplementedError:  # Windows event loops have no add_signal_handler
+            signal.signal(sig, lambda s, _f: loop.call_soon_threadsafe(_on_signal, s))
 
     code = 0
     try:
