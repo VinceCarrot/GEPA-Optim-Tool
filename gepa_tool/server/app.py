@@ -193,6 +193,7 @@ def register_local_dataset(body: LocalPathIn):
 
 class ProfileIn(BaseModel):
     data: Dict[str, Any]
+    scoring_set_size: Optional[int] = None
 
 
 @app.post("/api/datasets/profile")
@@ -202,16 +203,13 @@ def profile_dataset(body: ProfileIn):
     except ValidationError as e:
         raise HTTPException(422, _pyd_errors(e))
     try:
-        if spec.split.mode == "provided":
-            raw = ds.read_table(spec.split.train_path)
-        else:
-            raw = ds.read_table(spec.path)
-        prof = ds.profile(raw, spec)
-        if spec.split.mode == "auto":
-            prepared = ds.prepare(raw, spec)
-            tr, _dev, te = ds.stratified_split(prepared, spec.split.train_frac, spec.split.dev_frac, spec.split.seed)
-            prof["split"] = {"train": len(tr), "test": len(te), "train_pos": int(tr["target"].sum()),
-                             "test_pos": int(te["target"].sum())}
+        check = ds.check_data(spec, body.scoring_set_size)
+        # Column/length/label profile of the main file: the full dataset, else the train file.
+        main = spec.path if spec.path else spec.split.train_path
+        prof: Dict[str, Any] = {}
+        if main and ("full" in check["files"] or "train" in check["files"]):
+            prof = ds.profile(ds.read_table(main), spec)
+        prof["check"] = check
         return prof
     except ValueError as e:
         raise HTTPException(400, str(e))
@@ -237,6 +235,12 @@ def validate_config(body: Dict[str, Any]):
         blocks = protect.parse(cfg.seed_prompt)
     except protect.ProtectedSectionError as e:
         return {"ok": False, "errors": [{"loc": "seed_prompt", "msg": str(e)}]}
+    try:
+        check = ds.check_data(cfg.data, cfg.budget.scoring_set_size)
+    except Exception as e:
+        check = {"ok": False, "errors": [str(e)]}
+    if not check["ok"]:
+        return {"ok": False, "errors": [{"loc": "data", "msg": m} for m in check["errors"]]}
     return {"ok": True, "errors": [], "objective_text": ob.describe_objective(cfg.objective),
             "protected_sections": [{"name": b.name, "chars": len(b.body)} for b in blocks],
             "patience": cfg.patience}

@@ -1,6 +1,7 @@
 import React, { useRef, useState } from "react";
 import { api } from "../api.js";
 import { num, pct, classNames } from "../util.js";
+import { dataKey, dataChecked } from "../pages/NewRun.jsx";
 
 function templateFor(cols) {
   if (cols.length === 0) return "";
@@ -60,29 +61,80 @@ function FileLoader({ onLoaded, busyLabel }) {
   );
 }
 
+function FileSlot({ title, hint, info, onLoaded, onClear, clearLabel, busyLabel }) {
+  return (
+    <div className="field mt12">
+      <span className="lbl">{title}{hint && <span className="hint">{hint}</span>}</span>
+      {info ? (
+        <div className="row">
+          <span>✔ <b>{info.filename}</b> — {num(info.n_rows)} rows, {info.columns.length} columns</span>
+          <button className="linkbtn small" onClick={onClear}>{clearLabel || "replace"}</button>
+        </div>
+      ) : <FileLoader onLoaded={onLoaded} busyLabel={busyLabel} />}
+    </div>
+  );
+}
+
+function FilesTable({ files }) {
+  const order = ["full", "train", "test"].filter((k) => files[k]);
+  if (!order.length) return null;
+  return (
+    <table className="plain mt8" style={{ maxWidth: 760 }}>
+      <thead><tr><th>file</th><th>rows</th><th>usable</th><th>positive</th><th>positive rate</th><th>duplicate ids</th></tr></thead>
+      <tbody>
+        {order.map((k) => {
+          const f = files[k];
+          return (
+            <tr key={k}>
+              <td><b>{k}</b></td><td>{num(f.n_raw)}</td><td>{num(f.n_usable)}</td><td>{num(f.n_positive)}</td>
+              <td>{pct(f.positive_rate)}</td><td className={f.duplicate_ids ? "errtext" : ""}>{num(f.duplicate_ids)}</td>
+            </tr>
+          );
+        })}
+      </tbody>
+    </table>
+  );
+}
+
 export default function StepData({ cfg, set, st, patch }) {
   const d = cfg.data;
-  const info = st.dataset;
+  const provided = d.split.mode === "provided";
+  // The file whose columns drive the pickers: the full dataset, else the train file, else the test file.
+  const valid = (x) => (x && Array.isArray(x.columns) ? x : null);
+  const info = valid(st.dataset) || (provided ? valid(st.trainDataset) || valid(st.testDataset) : null);
   const [profile, setProfile] = useState(null);
   const [profErr, setProfErr] = useState("");
   const [checking, setChecking] = useState(false);
-  const provided = d.split.mode === "provided";
+  const key = dataKey(d);
+  const stale = profile && st.dataCheck && st.dataCheck.key !== key;
 
-  function onLoaded(res) {
+  // Pick columns from a newly loaded file. Only the first file guesses; later files keep the choices.
+  function columnsFrom(res, data) {
+    if (data.id_col && info) return data;
     const g = guess(res);
-    patch({ dataset: res, autoTemplate: true });
-    set("data", {
-      ...d,
-      path: res.path,
-      id_col: g.idCol,
-      label_col: g.labelCol,
-      positive_value: "",
-      input_columns: g.inputs,
-      input_template: templateFor(g.inputs),
-      split: { ...d.split, train_path: provided ? res.path : d.split.train_path },
-    });
+    patch({ autoTemplate: true });
+    return { ...data, id_col: g.idCol, label_col: g.labelCol, positive_value: "", input_columns: g.inputs,
+             input_template: templateFor(g.inputs) };
+  }
+
+  function onFull(res) {
+    patch({ dataset: res });
+    set("data", columnsFrom(res, { ...d, path: res.path }));
     setProfile(null);
   }
+  function onTrain(res) {
+    patch({ trainDataset: res });
+    set("data", columnsFrom(res, { ...d, split: { ...d.split, train_path: res.path } }));
+    setProfile(null);
+  }
+  function onTest(res) {
+    patch({ testDataset: res });
+    set("data", columnsFrom(res, { ...d, split: { ...d.split, test_path: res.path } }));
+    setProfile(null);
+  }
+  const clearFull = () => { patch({ dataset: null }); set("data.path", null); setProfile(null); };
+  const clearTrain = () => { patch({ trainDataset: null }); set("data.split.train_path", null); setProfile(null); };
+  const clearTest = () => { patch({ testDataset: null }); set("data.split.test_path", null); setProfile(null); };
 
   function toggleInput(col) {
     const cols = d.input_columns.includes(col) ? d.input_columns.filter((c) => c !== col) : [...d.input_columns, col];
@@ -96,9 +148,12 @@ export default function StepData({ cfg, set, st, patch }) {
     setProfErr("");
     setProfile(null);
     try {
-      setProfile(await api.post("/api/datasets/profile", { data: d }));
+      const res = await api.post("/api/datasets/profile", { data: d, scoring_set_size: cfg.budget.scoring_set_size });
+      setProfile(res);
+      patch({ dataCheck: { key, ok: res.check.ok } });
     } catch (e) {
       setProfErr(e.message);
+      patch({ dataCheck: { key, ok: false } });
     } finally {
       setChecking(false);
     }
@@ -107,17 +162,54 @@ export default function StepData({ cfg, set, st, patch }) {
   const labelInfo = info && info.columns.find((c) => c.name === d.label_col);
   const labelValues = info && d.label_col
     ? [...new Set((info.preview || []).map((r) => String(r[d.label_col])))].slice(0, 30) : [];
+  const canCheck = provided ? !!(d.split.train_path && d.split.test_path) : !!d.path;
+  const chk = profile && profile.check;
+  const passed = dataChecked(st);
 
   return (
     <div className="card">
       <div className="card-title">1. Annotated dataset</div>
       <p className="desc">One row per example. You need an id column, a gold label column and one or more input text columns. Parquet, CSV or Excel.</p>
-      <FileLoader onLoaded={onLoaded} />
-      {info && (
-        <div className="mt8">
-          Loaded <b>{info.filename}</b> — {num(info.n_rows)} rows, {info.columns.length} columns
-          {provided && <span className="muted"> (training file)</span>}
-        </div>
+
+      <div className="grid g5">
+        <label className="field">
+          <span className="lbl">Split</span>
+          <select value={d.split.mode} onChange={(e) => { set("data.split.mode", e.target.value); setProfile(null); }}>
+            <option value="auto">Automatic stratified split</option>
+            <option value="provided">I provide train and test files</option>
+          </select>
+        </label>
+        {!provided && (
+          <>
+            <label className="field"><span className="lbl">Train fraction</span>
+              <input type="number" step="0.01" value={d.split.train_frac} onChange={(e) => set("data.split.train_frac", Number(e.target.value))} /></label>
+            <label className="field"><span className="lbl">Held-out (unused) fraction</span>
+              <input type="number" step="0.01" value={d.split.dev_frac} onChange={(e) => set("data.split.dev_frac", Number(e.target.value))} /></label>
+            <label className="field"><span className="lbl">Test fraction</span>
+              <input type="number" step="0.01" value={d.split.test_frac} onChange={(e) => set("data.split.test_frac", Number(e.target.value))} /></label>
+          </>
+        )}
+        <label className="field">
+          <span className="lbl">Profanity word list (optional)</span>
+          <input value={d.profanity_wordlist || ""} placeholder="path to a word list"
+                 onChange={(e) => set("data.profanity_wordlist", e.target.value || null)} />
+        </label>
+      </div>
+
+      {!provided && (
+        <FileSlot title="Dataset" hint="split automatically into train and test (stratified by label)"
+                  info={st.dataset} onLoaded={onFull} onClear={clearFull} />
+      )}
+      {provided && (
+        <>
+          <FileSlot title="Train file (required)" hint="the optimizer scores and learns from these rows"
+                    info={st.trainDataset} onLoaded={onTrain} onClear={clearTrain} busyLabel="Reading train file…" />
+          <FileSlot title="Test file (required)" hint="held out; only used for the final evaluation"
+                    info={st.testDataset} onLoaded={onTest} onClear={clearTest} busyLabel="Reading test file…" />
+          <FileSlot title="Full dataset (optional)"
+                    hint="if given, train and test are checked against it: every id must exist with the same label and input"
+                    info={st.dataset} onLoaded={onFull} onClear={clearFull} clearLabel="remove" />
+        </>
       )}
 
       {info && (
@@ -165,75 +257,48 @@ export default function StepData({ cfg, set, st, patch }) {
         </>
       )}
 
-      <div className="grid g5 mt20">
-        <label className="field">
-          <span className="lbl">Split</span>
-          <select value={d.split.mode} onChange={(e) => {
-            const mode = e.target.value;
-            set("data.split", { ...d.split, mode, train_path: mode === "provided" ? d.path : d.split.train_path });
-          }}>
-            <option value="auto">Automatic stratified split</option>
-            <option value="provided">I provide train and test files</option>
-          </select>
-        </label>
-        {!provided && (
-          <>
-            <label className="field"><span className="lbl">Train fraction</span>
-              <input type="number" step="0.01" value={d.split.train_frac} onChange={(e) => set("data.split.train_frac", Number(e.target.value))} /></label>
-            <label className="field"><span className="lbl">Held-out (unused) fraction</span>
-              <input type="number" step="0.01" value={d.split.dev_frac} onChange={(e) => set("data.split.dev_frac", Number(e.target.value))} /></label>
-            <label className="field"><span className="lbl">Test fraction</span>
-              <input type="number" step="0.01" value={d.split.test_frac} onChange={(e) => set("data.split.test_frac", Number(e.target.value))} /></label>
-          </>
-        )}
-        {provided && (
-          <div style={{ gridColumn: "span 3" }} className="field">
-            <span className="lbl">Test file <span className="muted small">(the file loaded above is the training file)</span></span>
-            <FileLoader busyLabel="Reading test file…" onLoaded={(res) => {
-              patch({ testDataset: res });
-              set("data.split", { ...d.split, train_path: d.path, test_path: res.path });
-            }} />
-            {st.testDataset && <div className="small mt8">Test: <b>{st.testDataset.filename}</b> — {num(st.testDataset.n_rows)} rows</div>}
-          </div>
-        )}
-        <label className="field">
-          <span className="lbl">Profanity word list (optional)</span>
-          <input value={d.profanity_wordlist || ""} placeholder="path to a word list"
-                 onChange={(e) => set("data.profanity_wordlist", e.target.value || null)} />
-        </label>
-      </div>
-
       <div className="row mt20">
-        <button className="btn" onClick={check} disabled={checking || !d.path}>{checking ? "Checking…" : "Check data"}</button>
+        <button className="btn primary" onClick={check} disabled={checking || !canCheck}>{checking ? "Checking…" : "Check data"}</button>
+        {!canCheck && <span className="muted small">{provided ? "Load a train and a test file first." : "Load a dataset first."}</span>}
+        {passed && !profile && <span className="oktext small">✔ Data checked</span>}
+        {stale && <span className="warnbox small">Settings changed since the last check — run it again.</span>}
         {profErr && <span className="errtext small">{profErr}</span>}
       </div>
 
       {profile && (
         <div className="infobox mt12">
-          <div className="kv">
-            <span className="k">Usable rows</span><span>{num(profile.n_usable)} of {num(profile.n_raw)}</span>
-            <span className="k">Positives</span><span>{num(profile.n_positive)} ({pct(profile.positive_rate)})</span>
-            {profile.split && (<><span className="k">Split</span>
-              <span>train {num(profile.split.train)} ({num(profile.split.train_pos)} positive) · test {num(profile.split.test)} ({num(profile.split.test_pos)} positive)</span></>)}
-            <span className="k">Input length (chars)</span>
-            <span>min {num(profile.input_chars.min)} · median {num(profile.input_chars.median)} · p95 {num(profile.input_chars.p95)} · max {num(profile.input_chars.max)}</span>
-            <span className="k">Label values</span>
-            <span className="small">{Object.entries(profile.label_values).map(([k, v]) => `${k} (${v})`).join(" · ")}</span>
-          </div>
-          {profile.issues.length > 0 && (
-            <div className="warnbox mt12 small">{profile.issues.map((x) => <div key={x}>⚠ {x}</div>)}</div>
+          {chk && chk.errors.length > 0 && (
+            <div className="errbox mb8 small"><b>Fix before continuing</b>{chk.errors.map((x) => <div key={x}>✕ {x}</div>)}</div>
           )}
-          {profile.issues.length === 0 && <div className="oktext small mt8">✔ No data issues found.</div>}
-          <details className="mt12">
-            <summary className="small">Example rendered input</summary>
-            <div className="prompt mt8" style={{ maxHeight: 240 }}>{profile.example_input}</div>
-          </details>
+          {chk && chk.warnings.length > 0 && (
+            <div className="warnbox mb8 small">{chk.warnings.map((x) => <div key={x}>⚠ {x}</div>)}</div>
+          )}
+          {chk && chk.ok && <div className="oktext small mb8">✔ Data check passed{chk.warnings.length ? " (with warnings)" : ""}.</div>}
+          {chk && <FilesTable files={chk.files} />}
+          {profile.n_usable !== undefined && (
+            <div className="kv mt12">
+              <span className="k">Input length (chars)</span>
+              <span>min {num(profile.input_chars.min)} · median {num(profile.input_chars.median)} · p95 {num(profile.input_chars.p95)} · max {num(profile.input_chars.max)}</span>
+              <span className="k">Label values</span>
+              <span className="small">{Object.entries(profile.label_values).map(([k, v]) => `${k} (${v})`).join(" · ")}</span>
+            </div>
+          )}
+          {/* size/length notes from the profile (ids, classes and dropped rows are covered by the check) */}
+          {(profile.issues || []).filter((x) => /longer than|fewer than/.test(x)).map((x) => (
+            <div key={x} className="warnbox mt12 small">⚠ {x}</div>
+          ))}
+          {profile.example_input && (
+            <details className="mt12">
+              <summary className="small">Example rendered input</summary>
+              <div className="prompt mt8" style={{ maxHeight: 240 }}>{profile.example_input}</div>
+            </details>
+          )}
         </div>
       )}
 
       {info && (
         <details className="mt16">
-          <summary>Preview (first 20 rows)</summary>
+          <summary>Preview (first 20 rows of {info.filename})</summary>
           <div className="scrollbox mt8" style={{ maxHeight: 380 }}>
             <table className="plain">
               <thead><tr>{info.columns.map((c) => <th key={c.name}>{c.name}<div className="faint small">{c.dtype}</div></th>)}</tr></thead>

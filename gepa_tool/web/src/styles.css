@@ -135,6 +135,7 @@ input[type=checkbox] { width: 16px; height: 16px; accent-color: var(--blue); ver
   cursor: pointer;
   color: var(--text);
 }
+.step:disabled { opacity: 0.45; cursor: not-allowed; }
 .step.done { border-color: var(--green-border); color: #2a6b38; }
 .step.on { background: var(--blue); border-color: var(--blue); color: #fff; }
 .steps .reset { margin-left: 6px; font-size: 13px; }

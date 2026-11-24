@@ -43,15 +43,28 @@ export const DEFAULT_CONFIG = {
 const STEPS = ["Data", "Task", "Seed prompt", "Objective", "Models & budget", "Trial & start"];
 
 function fresh() {
-  return { cfg: JSON.parse(JSON.stringify(DEFAULT_CONFIG)), step: 0, maxStep: 0, dataset: null, testDataset: null,
-           autoTemplate: true, defaultsApplied: false, trial: null };
+  return { cfg: JSON.parse(JSON.stringify(DEFAULT_CONFIG)), step: 0, maxStep: 0, dataset: null, trainDataset: null,
+           testDataset: null, dataCheck: null, autoTemplate: true, defaultsApplied: false, trial: null };
 }
+
+// Older stored setups used the main file as the training file in "provided" mode.
+function migrate(s) {
+  const d = s.cfg.data;
+  if (d.split.mode === "provided" && d.path && d.path === d.split.train_path && !s.trainDataset) {
+    return { ...s, trainDataset: s.dataset, dataset: null, cfg: { ...s.cfg, data: { ...d, path: null } } };
+  }
+  return s;
+}
+
+// The Data step passes when "Check data" succeeded for exactly the current data settings.
+export const dataKey = (data) => JSON.stringify(data);
+export const dataChecked = (st) => !!st.dataCheck && st.dataCheck.ok && st.dataCheck.key === dataKey(st.cfg.data);
 
 function load() {
   try {
     const s = JSON.parse(localStorage.getItem(STORE_KEY));
     // Stored state may predate a field: fill anything missing from the defaults.
-    if (s && s.cfg) return { ...fresh(), ...s, cfg: deepMerge(DEFAULT_CONFIG, s.cfg) };
+    if (s && s.cfg) return migrate({ ...fresh(), ...s, cfg: deepMerge(DEFAULT_CONFIG, s.cfg) });
   } catch { /* ignore */ }
   return fresh();
 }
@@ -142,6 +155,8 @@ export default function NewRun() {
   }
 
   const props = { cfg: st.cfg, set, st, patch, settings };
+  const dataOk = dataChecked(st);
+  const locked = (i) => i > 0 && !dataOk;
   const Step = [StepData, StepTask, StepSeed, StepObjective, StepModels, StepTrial][st.step];
 
   return (
@@ -149,6 +164,7 @@ export default function NewRun() {
       <div className="steps">
         {STEPS.map((name, i) => (
           <button key={name} className={classNames("step", i === st.step && "on", i !== st.step && i <= st.maxStep && "done")}
+                  disabled={locked(i)} title={locked(i) ? "Run “Check data” on step 1 first" : undefined}
                   onClick={() => go(i)}>
             {i + 1}. {name}
           </button>
@@ -158,7 +174,12 @@ export default function NewRun() {
       <Step {...props} />
       <div className="navrow">
         <button className="btn" disabled={st.step === 0} onClick={() => go(st.step - 1)}>← Back</button>
-        {st.step < STEPS.length - 1 && <button className="btn primary" onClick={() => go(st.step + 1)}>Next →</button>}
+        {st.step < STEPS.length - 1 && (
+          <div className="row">
+            {locked(st.step + 1) && <span className="muted small">Run “Check data” and fix any errors to continue</span>}
+            <button className="btn primary" disabled={locked(st.step + 1)} onClick={() => go(st.step + 1)}>Next →</button>
+          </div>
+        )}
       </div>
     </div>
   );

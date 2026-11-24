@@ -15,7 +15,7 @@ import os
 import re
 import string
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -176,3 +176,140 @@ def profile(df_raw: pd.DataFrame, spec: DataSpec) -> dict:
         "issues": issues,
         "example_input": prepared[INPUT_COL].iloc[0] if n else "",
     }
+
+
+# ---------------------------------------------------------------------------
+# Pre-flight data check (setup wizard "Check data"; also run by config validation)
+# ---------------------------------------------------------------------------
+
+def _ids(df: pd.DataFrame, id_col: str) -> pd.Series:
+    return df[id_col].astype(str).str.strip()
+
+
+def _file_summary(prepared: pd.DataFrame, n_raw: int, id_col: str) -> dict:
+    n = len(prepared)
+    n_pos = int(prepared[TARGET_COL].sum()) if n else 0
+    return {"n_raw": n_raw, "n_usable": n, "n_positive": n_pos, "positive_rate": n_pos / n if n else 0.0,
+            "duplicate_ids": int(_ids(prepared, id_col).duplicated().sum()) if n else 0}
+
+
+def _examples(values, k: int = 5) -> str:
+    vals = sorted(map(str, values))
+    more = f" … (+{len(vals) - k} more)" if len(vals) > k else ""
+    return ", ".join(vals[:k]) + more
+
+
+def check_data(spec: DataSpec, scoring_set_size: Optional[int] = None) -> dict:
+    """Blocking errors and warnings for the configured data, before a trial or run.
+
+    auto split:     the dataset must have unique ids and usable rows of both classes.
+    provided split: train and test must each be readable, have every configured column, have unique ids,
+                    contain both classes, and share no ids (leakage). If a full dataset is also given, every
+                    train/test id must exist in it with the same label and the same rendered input; full rows
+                    that are in neither split are reported as a warning.
+    """
+    errors: List[str] = []
+    warnings: List[str] = []
+    files: Dict[str, dict] = {}
+    raws: Dict[str, pd.DataFrame] = {}
+    cols = [spec.id_col, spec.label_col, *spec.input_columns]
+
+    def load(name: str, path: Optional[str]) -> Optional[pd.DataFrame]:
+        if not path:
+            return None
+        try:
+            raw = read_table(path)
+        except Exception as e:  # unreadable / missing file
+            errors.append(f"{name}: cannot read {os.path.basename(path)} ({e})")
+            return None
+        missing = [c for c in cols if c not in raw.columns]
+        if missing:
+            errors.append(f"{name}: missing column(s) {missing}")
+            return None
+        raws[name] = raw
+        prepared = prepare(raw, spec)
+        files[name] = _file_summary(prepared, len(raw), spec.id_col)
+        if len(prepared) < len(raw):
+            warnings.append(f"{name}: {len(raw) - len(prepared)} rows dropped (missing id or input)")
+        return prepared
+
+    def need_both_classes(name: str) -> None:
+        s = files[name]
+        if s["n_usable"] == 0:
+            errors.append(f"{name}: no usable rows")
+        elif s["n_positive"] == 0:
+            errors.append(f"{name}: no positive rows ({spec.label_col} == {spec.positive_value!r})")
+        elif s["n_positive"] == s["n_usable"]:
+            errors.append(f"{name}: every row is positive (no negatives)")
+
+    def need_unique_ids(name: str) -> None:
+        if files[name]["duplicate_ids"]:
+            errors.append(f"{name}: {files[name]['duplicate_ids']} duplicate ids (ids must be unique; "
+                          "predictions are joined to gold labels by id)")
+
+    if spec.split.mode == "auto":
+        full = load("full", spec.path)
+        if full is not None:
+            need_both_classes("full")
+            need_unique_ids("full")
+            if not errors:
+                tr, _dev, te = stratified_split(full, spec.split.train_frac, spec.split.dev_frac, spec.split.seed)
+                files["train"] = _file_summary(tr, len(tr), spec.id_col)
+                files["test"] = _file_summary(te, len(te), spec.id_col)
+    else:
+        full = load("full", spec.path)
+        train = load("train", spec.split.train_path)
+        test = load("test", spec.split.test_path)
+        if not spec.split.train_path:
+            errors.append("train file is not set")
+        if not spec.split.test_path:
+            errors.append("test file is not set")
+        for name, p in (("train", train), ("test", test)):
+            if p is not None:
+                need_both_classes(name)
+                need_unique_ids(name)
+        if train is not None and test is not None:
+            overlap = set(_ids(train, spec.id_col)) & set(_ids(test, spec.id_col))
+            if overlap:
+                errors.append(f"train and test share {len(overlap)} ids (test leakage): {_examples(overlap)}")
+            tr_rate, te_rate = files["train"]["positive_rate"], files["test"]["positive_rate"]
+            if tr_rate and te_rate and abs(tr_rate - te_rate) > max(0.05, 0.5 * min(tr_rate, te_rate)):
+                warnings.append(f"positive rate differs between train ({tr_rate:.1%}) and test ({te_rate:.1%}); "
+                                "test metrics may not reflect what the optimizer saw")
+            tr_labels = set(raws["train"][spec.label_col].astype(str))
+            te_labels = set(raws["test"][spec.label_col].astype(str))
+            if te_labels - tr_labels:
+                warnings.append(f"label values only in test: {_examples(te_labels - tr_labels)}")
+        if full is not None:
+            if files["full"]["duplicate_ids"]:
+                warnings.append(f"full: {files['full']['duplicate_ids']} duplicate ids; the consistency check "
+                                "uses the first row of each id")
+            f = full.assign(_id=_ids(full, spec.id_col)).drop_duplicates("_id").set_index("_id")
+            used: set = set()
+            for name, p in (("train", train), ("test", test)):
+                if p is None:
+                    continue
+                q = p.assign(_id=_ids(p, spec.id_col)).drop_duplicates("_id").set_index("_id")
+                used |= set(q.index)
+                absent = q.index.difference(f.index)
+                if len(absent):
+                    errors.append(f"{name}: {len(absent)} ids are not in the full dataset: {_examples(absent)}")
+                common = q.index.intersection(f.index)
+                lab = common[(q.loc[common, TARGET_COL] != f.loc[common, TARGET_COL]).to_numpy()]
+                if len(lab):
+                    errors.append(f"{name}: {len(lab)} ids have a different label than in the full dataset: "
+                                  f"{_examples(lab)}")
+                txt = common[(q.loc[common, INPUT_COL] != f.loc[common, INPUT_COL]).to_numpy()]
+                if len(txt):
+                    errors.append(f"{name}: {len(txt)} ids have different input text than in the full dataset: "
+                                  f"{_examples(txt)}")
+            unused = set(f.index) - used
+            if unused and train is not None and test is not None:
+                warnings.append(f"{len(unused)} rows of the full dataset ({len(unused) / max(1, len(f)):.1%}) "
+                                "are in neither train nor test; they are not used")
+
+    tr_sum = files.get("train")
+    if scoring_set_size and tr_sum and tr_sum["n_usable"] < scoring_set_size:
+        warnings.append(f"train has {tr_sum['n_usable']} usable rows, fewer than the scoring set size "
+                        f"({scoring_set_size}); every train row will be scored")
+    return {"ok": not errors, "errors": errors, "warnings": warnings, "files": files}
