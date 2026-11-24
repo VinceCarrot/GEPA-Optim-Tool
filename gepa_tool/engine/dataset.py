@@ -43,7 +43,7 @@ def _profanity_pattern(wordlist: Optional[str]):
     order inside a group is preserved, so leftmost-first alternation picks the same word."""
     if not wordlist or not os.path.exists(wordlist):
         return None
-    words = [w.strip() for w in Path(wordlist).read_text().splitlines() if w.strip()]
+    words = [w.strip() for w in Path(wordlist).read_text(encoding="utf-8", errors="replace").splitlines() if w.strip()]
     if not words:
         return None
     groups: dict = {}
@@ -213,6 +213,8 @@ def check_data(spec: DataSpec, scoring_set_size: Optional[int] = None) -> dict:
     files: Dict[str, dict] = {}
     raws: Dict[str, pd.DataFrame] = {}
     cols = [spec.id_col, spec.label_col, *spec.input_columns]
+    if spec.profanity_wordlist and not os.path.isfile(spec.profanity_wordlist):
+        errors.append(f"profanity word list not found: {spec.profanity_wordlist} (upload it again)")
 
     def load(name: str, path: Optional[str]) -> Optional[pd.DataFrame]:
         if not path:

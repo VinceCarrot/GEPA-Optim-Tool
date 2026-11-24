@@ -166,6 +166,33 @@ async def upload_dataset(file: UploadFile = File(...)):
             "preview": _json_safe_records(df.head(20).astype(str))}
 
 
+WORDLIST_MAX_BYTES = 5 * 1024 * 1024
+
+
+@app.post("/api/wordlists")
+async def upload_wordlist(file: UploadFile = File(...)):
+    """Profanity word list: plain text, one word or phrase per line (matches are masked as **)."""
+    ext = os.path.splitext(file.filename or "")[1].lower()
+    if ext not in (".txt", ".csv", ".lst", ""):
+        raise HTTPException(400, "Upload a plain-text word list (.txt), one word per line")
+    raw = await file.read()
+    if len(raw) > WORDLIST_MAX_BYTES:
+        raise HTTPException(400, "Word list is larger than 5 MB")
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        raise HTTPException(400, "Word list must be UTF-8 text")
+    words = [w.strip() for w in text.splitlines() if w.strip()]
+    if not words:
+        raise HTTPException(400, "Word list is empty")
+    wid = uuid.uuid4().hex[:10]
+    safe = os.path.basename(file.filename or "wordlist.txt").replace(" ", "_")
+    path = os.path.join(UPLOADS, f"{wid}__wordlist__{safe}")
+    with open(path, "w", encoding="utf-8", newline="\n") as out:
+        out.write("\n".join(words) + "\n")
+    return {"path": path, "filename": file.filename, "n_words": len(words), "preview": words[:10]}
+
+
 class LocalPathIn(BaseModel):
     path: str
 

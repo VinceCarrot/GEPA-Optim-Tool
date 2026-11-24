@@ -61,6 +61,47 @@ function FileLoader({ onLoaded, busyLabel }) {
   );
 }
 
+function WordList({ path, info, onChange }) {
+  const ref = useRef(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  async function upload(file) {
+    setBusy(true);
+    setErr("");
+    try {
+      onChange(await api.upload("/api/wordlists", file));
+    } catch (e) {
+      setErr(e.message);
+    } finally {
+      setBusy(false);
+      ref.current.value = "";
+    }
+  }
+  const name = info?.filename || (path ? path.split(/[\\/]/).pop().replace(/^[0-9a-f]{10}__wordlist__/, "") : "");
+  return (
+    <div className="field" style={{ gridColumn: "span 2" }}>
+      <span className="lbl">Profanity word list (optional)
+        <span className="hint">plain text, one word per line; matching words in the inputs are replaced with **</span></span>
+      <input type="file" ref={ref} style={{ display: "none" }} accept=".txt,.lst,.csv,text/plain"
+             onChange={(e) => e.target.files[0] && upload(e.target.files[0])} />
+      {path ? (
+        <div className="row">
+          <span title={info?.preview ? `e.g. ${info.preview.join(", ")}` : path}>
+            ✔ <b>{name}</b>{info ? ` — ${num(info.n_words)} words` : ""}</span>
+          <button className="linkbtn small" disabled={busy} onClick={() => ref.current.click()}>replace</button>
+          <button className="linkbtn small" onClick={() => onChange(null)}>remove</button>
+        </div>
+      ) : (
+        <div className="row">
+          <button className="btn" disabled={busy} onClick={() => ref.current.click()}>{busy ? "Uploading…" : "Upload word list…"}</button>
+          <span className="muted small">none — inputs are used as is</span>
+        </div>
+      )}
+      {err && <div className="errtext small mt8">{err}</div>}
+    </div>
+  );
+}
+
 function FileSlot({ title, hint, info, onLoaded, onClear, clearLabel, busyLabel }) {
   return (
     <div className="field mt12">
@@ -189,11 +230,8 @@ export default function StepData({ cfg, set, st, patch }) {
               <input type="number" step="0.01" value={d.split.test_frac} onChange={(e) => set("data.split.test_frac", Number(e.target.value))} /></label>
           </>
         )}
-        <label className="field">
-          <span className="lbl">Profanity word list (optional)</span>
-          <input value={d.profanity_wordlist || ""} placeholder="path to a word list"
-                 onChange={(e) => set("data.profanity_wordlist", e.target.value || null)} />
-        </label>
+        <WordList path={d.profanity_wordlist} info={st.wordlist}
+                  onChange={(res) => { patch({ wordlist: res }); set("data.profanity_wordlist", res ? res.path : null); setProfile(null); }} />
       </div>
 
       {!provided && (

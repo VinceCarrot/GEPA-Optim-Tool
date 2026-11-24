@@ -44,7 +44,7 @@ const STEPS = ["Data", "Task", "Seed prompt", "Objective", "Models & budget", "T
 
 function fresh() {
   return { cfg: JSON.parse(JSON.stringify(DEFAULT_CONFIG)), step: 0, maxStep: 0, dataset: null, trainDataset: null,
-           testDataset: null, dataCheck: null, autoTemplate: true, defaultsApplied: false, trial: null };
+           testDataset: null, wordlist: null, dataCheck: null, autoTemplate: true, defaultsApplied: false, trial: null };
 }
 
 // Older stored setups used the main file as the training file in "provided" mode.
