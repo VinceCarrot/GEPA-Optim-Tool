@@ -169,7 +169,8 @@ class Optimizer:
                 self.events.emit("stage", round=_r, stage=stage, status=status)
 
             try:
-                result = await refl.reflect(cfg, parent.prompt_text, pb, errors, self.history, phase, on_stage)
+                result = await refl.reflect(cfg, parent.prompt_text, pb, errors, self.history, phase, on_stage,
+                                            dump_dir=os.path.join(self.run_dir, "failed_payloads", f"round{r}"))
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -181,7 +182,9 @@ class Optimizer:
                 continue
 
             self.events.emit("reflection", round=r, parent_id=parent_id, diagnosis=result.diagnosis,
-                             clusters=[c.model_dump() for c in result.clusters], n_analyses=result.n_analyses)
+                             clusters=[c.model_dump() for c in result.clusters], n_analyses=result.n_analyses,
+                             n_analysis_failed=result.n_analysis_failed,
+                             n_analysis_blocked=result.n_analysis_blocked)
             for rej in result.rejected:
                 self.events.emit("proposal_rejected", round=r, reason_code="protected_violation", **rej)
 

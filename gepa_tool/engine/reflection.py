@@ -12,16 +12,20 @@ masked as [[PROTECTED:name]] tokens for Stage 2 and validated / restored afterwa
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
-from typing import Callable, Dict, List, Optional
+import os
+import time
+from typing import Callable, Dict, List, Optional, Tuple
 
 from pydantic import BaseModel, Field
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
 
 from . import llm as llm_mod
 from . import objective as obj
 from . import protect
 from .dataset import INPUT_COL, TARGET_COL
+from .inference import _is_auth_error
 from .sanitize import sanitize_payload
 from .spec import METRIC_LABELS, RunConfig
 
@@ -67,6 +71,8 @@ class ReflectionResult(BaseModel):
     proposals: List[PromptProposal]
     rejected: List[dict] = Field(default_factory=list)  # proposals dropped for protected-section violations
     n_analyses: int = 0
+    n_analysis_failed: int = 0    # sampled errors skipped because their analysis call failed
+    n_analysis_blocked: int = 0   # ... of which were refused by content moderation
 
 
 # ---------------------------------------------------------------------------
@@ -282,29 +288,97 @@ def _format_history(history: Optional[List[dict]], max_n: int) -> str:
     )
 
 
+def is_moderation_block(e: BaseException) -> bool:
+    """A content-moderation refusal (e.g. TrojAI). Deterministic for a given payload, so never retried."""
+    s = str(e).lower()
+    return "moderation" in s or "trojai" in s
+
+
+def _should_retry(e: BaseException) -> bool:
+    return isinstance(e, Exception) and not is_moderation_block(e)
+
+
+class _LLM:
+    """A structured LLM that is rebuilt every MAX_AGE seconds and after an auth error.
+
+    SafeChain bakes the access token into the client when it is built, so one client kept for a
+    long reflection stage starts failing with 401 (same reason as inference._ChainHolder).
+    """
+    MAX_AGE = 240.0
+    AUTH_REBUILD_GAP = 5.0
+
+    def __init__(self, model_id: str, temperature: float, schema):
+        self.model_id, self.temperature, self.schema = model_id, temperature, schema
+        self.obj = None
+        self.built_at = 0.0
+        self.lock = asyncio.Lock()
+
+    async def get(self, force: bool = False):
+        async with self.lock:
+            age = time.time() - self.built_at
+            if self.obj is None or age > self.MAX_AGE or (force and age >= self.AUTH_REBUILD_GAP):
+                self.obj = await llm_mod.build_structured(self.model_id, self.temperature, self.schema)
+                self.built_at = time.time()
+            return self.obj
+
+
 def _retrying(timeout: float):
-    @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=2, max=30), reraise=True)
-    async def _invoke(structured_llm, payload: str):
-        return await asyncio.wait_for(structured_llm.ainvoke(payload), timeout=timeout)
+    @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=2, max=30),
+           retry=retry_if_exception(_should_retry), reraise=True)
+    async def _invoke(llm: _LLM, payload: str):
+        structured = await llm.get()
+        try:
+            return await asyncio.wait_for(structured.ainvoke(payload), timeout=timeout)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            if _is_auth_error(e):
+                logger.warning("auth error from %s; rebuilding the client", llm.model_id)
+                await llm.get(force=True)
+            raise
     return _invoke
+
+
+def _save_failed(dump_dir: Optional[str], name: str, payload: str, error: BaseException, **meta) -> Optional[str]:
+    """Write the exact payload that failed (as sent, after sanitizing) plus one index line. Returns its path."""
+    if not dump_dir:
+        return None
+    try:
+        os.makedirs(dump_dir, exist_ok=True)
+        path = os.path.join(dump_dir, f"{name}.txt")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(payload)
+        rec = {"file": os.path.basename(path), "blocked": is_moderation_block(error),
+               "error": str(error)[:1000], **meta}
+        with open(os.path.join(dump_dir, "index.jsonl"), "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, default=str) + "\n")
+        return path
+    except OSError as e:
+        logger.warning("could not save failed payload %s: %s", name, e)
+        return None
 
 
 # ---------------------------------------------------------------------------
 # Stages
 # ---------------------------------------------------------------------------
 
-async def analyze_errors(cfg: RunConfig, prompt_text: str, errors: Dict[str, List[dict]]) -> List[dict]:
+async def analyze_errors(cfg: RunConfig, prompt_text: str, errors: Dict[str, List[dict]],
+                         dump_dir: Optional[str] = None) -> Tuple[List[dict], List[dict]]:
+    """Per-error analyses. Returns (analyses, failures).
+
+    A sampled error whose analysis still fails (after retries and the task-model fallback) is
+    skipped and its payload saved under dump_dir; the stage fails only if every analysis failed.
+    """
     r = cfg.reflection
     invoke = _retrying(cfg.budget.reflection_timeout_seconds)
     sem = asyncio.Semaphore(r.analysis_concurrency)
-    structured = await llm_mod.build_structured(cfg.models.error_analysis_model_id,
-                                                cfg.models.reflection_temperature, ErrorAnalysis)
+    primary = _LLM(cfg.models.error_analysis_model_id, cfg.models.reflection_temperature, ErrorAnalysis)
     fallback = None
     if cfg.models.task_model_id != cfg.models.error_analysis_model_id:
-        fallback = await llm_mod.build_structured(cfg.models.task_model_id,
-                                                  cfg.models.reflection_temperature, ErrorAnalysis)
+        fallback = _LLM(cfg.models.task_model_id, cfg.models.reflection_temperature, ErrorAnalysis)
     has_protected = bool(protect.parse(prompt_text))
     pos, neg = cfg.task.positive_label, cfg.task.negative_label
+    failures: List[dict] = []
 
     async def _one(ex: dict, error_type: str, delay: float):
         await asyncio.sleep(delay)
@@ -320,15 +394,24 @@ async def analyze_errors(cfg: RunConfig, prompt_text: str, errors: Dict[str, Lis
             error_type=error_type,
         )
         payload = sanitize_payload(cfg, payload)
+        res, err = None, None
         async with sem:
-            try:
-                res = await invoke(structured, payload)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                if fallback is None:
+            for llm in ([primary, fallback] if fallback is not None else [primary]):
+                try:
+                    res = await invoke(llm, payload)
+                    break
+                except asyncio.CancelledError:
                     raise
-                res = await invoke(fallback, payload)
+                except Exception as e:
+                    err = e
+        if res is None:
+            ex_id = ex.get(cfg.data.id_col)
+            name = f"error_analysis_{error_type}_{len(failures):03d}"
+            path = _save_failed(dump_dir, name, payload, err, id=ex_id, error_type=error_type)
+            failures.append({"id": ex_id, "error_type": error_type, "blocked": is_moderation_block(err),
+                             "error": str(err)[:500], "payload_file": path})
+            logger.warning("error analysis skipped for id=%s (%s): %s", ex_id, error_type, err)
+            return None
         return {
             "id": ex.get(cfg.data.id_col),
             "error_type": error_type,
@@ -343,12 +426,39 @@ async def analyze_errors(cfg: RunConfig, prompt_text: str, errors: Dict[str, Lis
     for i, ex in enumerate(errors.get("false_negatives", [])):
         tasks.append(_one(ex, "false_negative", i * r.analysis_request_delay))
     if not tasks:
-        return []
-    return list(await asyncio.gather(*tasks))
+        return [], []
+    futs = [asyncio.ensure_future(t) for t in tasks]
+    try:
+        results = await asyncio.gather(*futs)
+    except BaseException:
+        for f in futs:  # do not leave analysis calls running in the background
+            f.cancel()
+        raise
+    analyses = [a for a in results if a is not None]
+    if not analyses:
+        n_blocked = sum(f["blocked"] for f in failures)
+        where = f"; payloads saved in {dump_dir}" if dump_dir else ""
+        raise RuntimeError(f"All {len(failures)} error analyses failed ({n_blocked} blocked by content moderation)"
+                           f"{where}. First error: {failures[0]['error']}")
+    return analyses, failures
+
+
+async def _invoke_or_save(cfg: RunConfig, llm: _LLM, payload: str, stage: str,
+                          dump_dir: Optional[str]):
+    """Invoke one reflection call; on final failure save the payload and re-raise with its path."""
+    try:
+        return await _retrying(cfg.budget.reflection_timeout_seconds)(llm, payload)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        path = _save_failed(dump_dir, stage, payload, e, stage=stage)
+        if path is None:
+            raise
+        raise RuntimeError(f"{stage} call failed: {e} (payload saved to {path})") from e
 
 
 async def cluster_errors(cfg: RunConfig, prompt_text: str, bundle: Dict, analyses: List[dict],
-                         phase: str, n_clusters: int) -> ClusteringOutput:
+                         phase: str, n_clusters: int, dump_dir: Optional[str] = None) -> ClusteringOutput:
     m = bundle["metrics"]
     payload = CLUSTERING_PROMPT.format(
         task_block=_task_block(cfg),
@@ -361,9 +471,8 @@ async def cluster_errors(cfg: RunConfig, prompt_text: str, bundle: Dict, analyse
         n_clusters=n_clusters,
     )
     payload = sanitize_payload(cfg, payload)
-    structured = await llm_mod.build_structured(cfg.models.reflection_model_id,
-                                                cfg.models.reflection_temperature, ClusteringOutput)
-    return await _retrying(cfg.budget.reflection_timeout_seconds)(structured, payload)
+    llm = _LLM(cfg.models.reflection_model_id, cfg.models.reflection_temperature, ClusteringOutput)
+    return await _invoke_or_save(cfg, llm, payload, "clustering", dump_dir)
 
 
 def _ensure_placeholder(cfg: RunConfig, text: str) -> str:
@@ -374,7 +483,7 @@ def _ensure_placeholder(cfg: RunConfig, text: str) -> str:
 
 
 async def mutate(cfg: RunConfig, prompt_text: str, bundle: Dict, clustering: ClusteringOutput,
-                 history: Optional[List[dict]], phase: str, n_proposals: int):
+                 history: Optional[List[dict]], phase: str, n_proposals: int, dump_dir: Optional[str] = None):
     """Returns (valid_proposals, rejected_records). Proposals carry the unmasked prompt."""
     masked, originals = protect.mask(prompt_text)
     rule = ""
@@ -397,10 +506,9 @@ async def mutate(cfg: RunConfig, prompt_text: str, bundle: Dict, clustering: Clu
             placeholder=cfg.task.input_placeholder,
         ) + extra
 
-    structured = await llm_mod.build_structured(cfg.models.reflection_model_id,
-                                                cfg.models.reflection_temperature, MutationOutput)
+    structured = _LLM(cfg.models.reflection_model_id, cfg.models.reflection_temperature, MutationOutput)
     invoke = _retrying(cfg.budget.reflection_timeout_seconds)
-    response = await invoke(structured, _payload())
+    response = await _invoke_or_save(cfg, structured, _payload(), "mutation", dump_dir)
 
     valid: List[PromptProposal] = []
     rejected: List[dict] = []
@@ -457,21 +565,25 @@ def choose_error_mix(cfg: RunConfig, phase: str, metrics: Dict) -> Dict[str, int
 
 
 async def reflect(cfg: RunConfig, prompt_text: str, bundle: Dict, errors: Dict[str, List[dict]],
-                  history: List[dict], phase: str, on_stage: Optional[StageFn] = None) -> ReflectionResult:
+                  history: List[dict], phase: str, on_stage: Optional[StageFn] = None,
+                  dump_dir: Optional[str] = None) -> ReflectionResult:
+    """dump_dir: where payloads of failed / moderation-blocked reflection calls are saved."""
     stage = on_stage or (lambda s, st: None)
     n = cfg.budget.proposals_per_round
 
     stage("error_analysis", "start")
-    analyses = await analyze_errors(cfg, prompt_text, errors)
+    analyses, failures = await analyze_errors(cfg, prompt_text, errors, dump_dir)
     stage("error_analysis", "done")
 
     stage("clustering", "start")
-    clustering = await cluster_errors(cfg, prompt_text, bundle, analyses, phase, n)
+    clustering = await cluster_errors(cfg, prompt_text, bundle, analyses, phase, n, dump_dir)
     stage("clustering", "done")
 
     stage("mutation", "start")
-    proposals, rejected = await mutate(cfg, prompt_text, bundle, clustering, history, phase, n)
+    proposals, rejected = await mutate(cfg, prompt_text, bundle, clustering, history, phase, n, dump_dir)
     stage("mutation", "done")
 
     return ReflectionResult(diagnosis=clustering.diagnosis, clusters=clustering.clusters,
-                            proposals=proposals, rejected=rejected, n_analyses=len(analyses))
+                            proposals=proposals, rejected=rejected, n_analyses=len(analyses),
+                            n_analysis_failed=len(failures),
+                            n_analysis_blocked=sum(f["blocked"] for f in failures))

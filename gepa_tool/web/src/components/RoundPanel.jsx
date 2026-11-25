@@ -176,6 +176,13 @@ export default function RoundPanel({ runId, state, round, selectedChild, onSelec
       {round.n_fp !== undefined && (
         <div className="muted mt12">Analysed {round.n_fp} false positives and {round.n_fn} false negatives from the parent.</div>
       )}
+      {round.n_analysis_failed > 0 && (
+        <div className="warnbox mt8 small">
+          ⚠ {round.n_analysis_failed} error analyses skipped
+          {round.n_analysis_blocked ? ` (${round.n_analysis_blocked} blocked by content moderation)` : ""}; clustering used the
+          other {round.n_analyses}. Payloads: failed_payloads/round{round.round}/ in the run folder.
+        </div>
+      )}
       {round.errors.map((e, i) => <div key={i} className="errbox mt12 small">Round failed: {e}</div>)}
       <Clusters round={round} />
       {round.dropped.length > 0 && (

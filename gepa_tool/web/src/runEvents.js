@@ -88,7 +88,8 @@ export function reduceEvents(events) {
         Object.assign(R(e.round), { n_fp: e.n_fp, n_fn: e.n_fn });
         break;
       case "reflection":
-        Object.assign(R(e.round), { diagnosis: e.diagnosis, clusters: e.clusters, n_analyses: e.n_analyses });
+        Object.assign(R(e.round), { diagnosis: e.diagnosis, clusters: e.clusters, n_analyses: e.n_analyses,
+          n_analysis_failed: e.n_analysis_failed || 0, n_analysis_blocked: e.n_analysis_blocked || 0 });
         break;
       case "proposal_rejected":
         R(e.round).dropped.push(e);
